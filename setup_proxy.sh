@@ -8,6 +8,8 @@ export NODE_LINK=${NODE_LINK:-''}
 if [ -z "$NODE_LINK" ]; then
   echo "[INFO] 未配置代理，直连模式"
   echo "IS_PROXY=false" >> $GITHUB_ENV
+  echo "USE_PROXY=false" >> $GITHUB_ENV
+  echo "PROXY_STATUS=直连" >> $GITHUB_ENV
   exit 0
 fi
 
@@ -349,11 +351,17 @@ EOF
     echo "[INFO] ✅ 节点 [$node_idx] 连接成功！ | 📍 IP: $ip_addr | 🌍 国家: $country"
     echo "IS_PROXY=true" >> $GITHUB_ENV
     echo "PROXY_SERVER=socks5://127.0.0.1:1080" >> $GITHUB_ENV
+    
+    # 写入状态标志
+    echo "USE_PROXY=true" >> $GITHUB_ENV
+    echo "PROXY_STATUS=代理: $ip_addr ($country)" >> $GITHUB_ENV
     exit 0
   else
     echo "[WARN] ❌ 节点 [$node_idx] 无法连接或超时，尝试下一个节点..."
   fi
 done
 
-echo "[ERROR] ❌ 所有配置的代理节点均测试失败！"
-exit 1
+echo "[WARN] ❌ 所有配置的代理节点均测试失败，自动切换为直连模式！"
+echo "USE_PROXY=false" >> $GITHUB_ENV
+echo "PROXY_STATUS=直连 (代理全部失效)" >> $GITHUB_ENV
+exit 0
