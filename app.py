@@ -184,7 +184,7 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         lines.append(extra)
     if error:
         lines.append(f"⚠️ 错误信息: {error}")
-    lines.append(f"⏱️ 登录时间: {now}")
+    lines.append(f"⏱️ 运行时间: {now}")
     return "\n".join(lines)
 
 # 等待Turnstile验证通过
@@ -240,7 +240,6 @@ def extract_expiry_date(page_source: str) -> str:
             if len(date_str.split('/')[-1]) == 4:  # 年份长度4
                 parts = date_str.split('/')
                 if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
     return None
@@ -633,7 +632,7 @@ def main():
                     )
                 )
 
-        # 更新SESSION_TOKEN 
+        # ========== Token 更新及 TG 通知逻辑 ==========
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
         new_token, token_expiry = get_cookie_info(sb, "session_token")
         old_token = SESSION_TOKEN
@@ -641,20 +640,38 @@ def main():
         if should_update_cookie(new_token, old_token, token_expiry):
             print("🔄 SESSION_TOKEN 需要更新")
             
+            token_sync_status = []
+            
             # 1. 尝试更新 GitHub Secret (适用于 Actions 部署)
             if GH_TOKEN:
                 if update_github_secret("SESSION_TOKEN", new_token):
                     print("✅ SESSION_TOKEN 更新成功 (GitHub Secrets)")
+                    token_sync_status.append("✅ GitHub Secrets: 更新成功")
                 else:
                     print("⚠️ 更新 GitHub Secret 失败，请检查 GH_TOKEN 权限")
+                    token_sync_status.append("❌ GitHub Secrets: 更新失败")
             else:
                 print("⚠️ 未设置 GH_TOKEN，跳过更新 GitHub Secrets")
             
             # 2. 尝试更新 cron-job.org 
             if CRONJOB_API_KEY and CRONJOB_ID:
-                update_cronjob_org(new_token)
+                if update_cronjob_org(new_token):
+                    token_sync_status.append("✅ Cron-job.org: 写入成功")
+                else:
+                    token_sync_status.append("❌ Cron-job.org: 写入失败")
             else:
                  print("⚠️ 未设置 CRONJOB_API_KEY 或 CRONJOB_ID，跳过更新 cron-job.org")
+
+            # 3. 汇总发送 Token 更新的独立通知
+            if token_sync_status:
+                sync_msg = "\n".join(token_sync_status)
+                masked_token = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
+                send_telegram_message(
+                    format_notification(
+                        "🔄 SESSION_TOKEN 已刷新",
+                        extra=f"🔑 新 Token: {masked_token}\n\n同步状态:\n{sync_msg}"
+                    )
+                )
 
         else:
             print("✅ SESSION_TOKEN 无需更新")
