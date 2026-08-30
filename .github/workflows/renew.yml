@@ -11,6 +11,7 @@ jobs:
     permissions:
       actions: write
       contents: read
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -19,12 +20,13 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install seleniumbase requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install --quiet seleniumbase requests
           seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box)
@@ -34,6 +36,7 @@ jobs:
         run: |
           chmod +x setup_proxy.sh
           bash setup_proxy.sh
+          echo "代理状态: ${PROXY_STATUS:-未设置}"
 
       - name: 🚀 运行续期脚本
         env:
@@ -45,29 +48,52 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           CRONJOB_API_KEY: ${{ secrets.CRONJOB_API_KEY }}
           CRONJOB_ID: ${{ secrets.CRONJOB_ID }}
+          IS_PROXY: ${{ env.IS_PROXY }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
+          HEADLESS: "true"
         run: |
-          xvfb-run --auto-servernum python3 app.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
-          pkill -f sing-box || true
-          pkill -f chromedriver || true
-          pkill -f chrome || true
-          pkill -f Xvfb || true
+          pkill -f sing-box 2>/dev/null || true
+          pkill -f chromedriver 2>/dev/null || true
+          pkill -f chrome 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
           rm -f sing-box sing-box-config.json sing-box.log
+          echo "清理完成"
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          CURRENT_RUN_ID="${{ github.run_id }}"
+          KEEP_LATEST=5
+          echo "保留最近 ${KEEP_LATEST} 条运行记录 (跳过当前运行 ID: ${CURRENT_RUN_ID})"
+          
+          runs=$(gh run list \
+            --workflow="${{ github.workflow }}" \
+            --status=completed \
+            --limit=100 \
+            --json databaseId,status \
+            --jq ".[].databaseId | select(. != ${CURRENT_RUN_ID})")
+          
+          if [ -z "$runs" ]; then
+            echo "没有旧的运行记录需要清理"
+            exit 0
+          fi
+          
           count=0
+          deleted=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt $KEEP_LATEST ]; then
               echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
+              if gh run delete "$run_id" >/dev/null 2>&1; then
+                deleted=$((deleted + 1))
+              fi
             fi
           done
+          echo "清理完成，共删除 ${deleted} 条旧记录"
