@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, requests, subprocess
-import urllib.request, urllib.parse, urllib.error
+import os
+import re
+import sys
+import time
+import json
+import requests
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime
 from seleniumbase import SB
 
-# 环境变量配置(可以直接私库在双引号里填写)
+# ==================== 环境变量配置 ====================
 EMAIL           = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
 SESSION_TOKEN   = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
 DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
@@ -23,32 +31,39 @@ if DISCORD_TOKEN:
     DC_TOKEN = _parts[-1].strip()
 
 if not SESSION_TOKEN and not DC_TOKEN:
-    print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN,脚本终止。")
+    print("ℹ️ 未配置 SESSION_TOKEN 和 Discord Token,脚本终止。")
     sys.exit(1)
 
-# 构造cookie
+# 构造基础 Cookie 字典
 COOKIES = {
     "session_token": SESSION_TOKEN,
     "login": "true",
     "theme": "system",
 }
 
-# 记录本次登录方式（用于通知）
+# 记录本次登录方式（用于通知展示）
 _LOGIN_METHOD = "SESSION_TOKEN"
 
-# 获取cookie到期时间
+
+# ==================== 核心辅助函数 ====================
+
 def get_cookie_info(sb, name):
-    cookies = sb.get_cookies()
-    for c in cookies:
-        if c.get('name') == name:
-            value = c.get('value')
-            expiry_ts = c.get('expiry')
-            expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
-            return value, expiry_dt
+    """获取指定 Cookie 的值及其过期时间"""
+    try:
+        cookies = sb.get_cookies()
+        for c in cookies:
+            if c.get('name') == name:
+                value = c.get('value')
+                expiry_ts = c.get('expiry')
+                expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
+                return value, expiry_dt
+    except Exception as e:
+        print(f"⚠️ 获取 Cookie 信息异常: {e}")
     return None, None
 
-# 检查是否需要更新cookie
+
 def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
+    """判断 Cookie 是否需要更新"""
     if new_value is None:
         return False
     if new_value != old_value:
@@ -59,13 +74,14 @@ def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
             return True
     return False
 
-# 更新cookie到secrets
+
 def update_github_secret(secret_name, new_value):
+    """通过 GitHub CLI 更新仓库 Secret"""
     if not new_value:
         print(f"⚠️ 跳过更新 {secret_name}：新值为空")
         return False
     masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
-    print(f"🔄 更新 Secret: {secret_name} (新值: {masked})")
+    print(f"🔄 更新 GitHub Secret: {secret_name} (新值: {masked})")
     try:
         env = os.environ.copy()
         if GH_TOKEN:
@@ -76,19 +92,21 @@ def update_github_secret(secret_name, new_value):
             env=env
         )
         if proc.returncode == 0:
+            print("✅ GitHub Secret 更新成功")
             return True
         else:
-            print(f"❌ 更新失败: {proc.stderr.strip()}")
+            print(f"❌ GitHub Secret 更新失败: {proc.stderr.strip()}")
             return False
     except Exception as e:
-        print(f"❌ 异常: {e}")
+        print(f"❌ 更新 GitHub Secret 发生异常: {e}")
         return False
 
-# 写回 cron-job.org
-def update_cronjob_org(new_token: str) -> bool:
+
+def update_cronjob_org(new_token: str) -> tuple[bool, str]:
+    """写回 cron-job.org 并获取下一次执行时间"""
     if not CRONJOB_API_KEY or not CRONJOB_ID:
         print("⚠️ 未配置 CRONJOB_API_KEY 或 CRONJOB_ID，跳过更新 cron-job.org")
-        return False
+        return False, ""
         
     print("🔄 尝试将新 Token 写回 cron-job.org...")
     api_url = f"https://api.cron-job.org/jobs/{CRONJOB_ID}"
@@ -98,67 +116,75 @@ def update_cronjob_org(new_token: str) -> bool:
     }
     
     try:
-        # 1. 获取当前 Job 的完整配置
         resp = requests.get(api_url, headers=headers, timeout=10)
         if resp.status_code != 200:
             print(f"❌ 获取 cron-job 失败: HTTP {resp.status_code} - {resp.text}")
-            return False
+            return False, ""
             
-        job_data = resp.json().get("jobDetails", {})
+        job_wrapper = resp.json()
+        job_data = job_wrapper.get("jobDetails", {})
         
-        # 2. 替换 Token (支持 Header 和 URL 参数两种最常见的传参方式)
+        # 提取下一次执行时间戳并转换为本地时间格式
+        next_exec_ts = job_data.get("nextExecution")
+        next_run_str = "未知"
+        if next_exec_ts:
+            try:
+                dt = datetime.fromtimestamp(next_exec_ts)
+                next_run_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        
         updated = False
-        
-        # 场景 A: Token 放在 HTTP Headers 里
         if "extendedData" in job_data and "headers" in job_data["extendedData"]:
             header_keys = [k for k in job_data["extendedData"]["headers"].keys()]
             for k in header_keys:
                 if k.upper() == "SESSION_TOKEN":
                     job_data["extendedData"]["headers"][k] = new_token
                     updated = True
-            # 如果没找到且 headers 存在，直接追加进去以防万一
             if not updated:
                 job_data["extendedData"]["headers"]["SESSION_TOKEN"] = new_token
                 updated = True
                 
-        # 场景 B: Token 放在 URL 里
         if not updated:
             url = job_data.get("url", "")
             if "SESSION_TOKEN=" in url.upper():
-                 # 匹配大小写不敏感的 session_token=...
                  job_data["url"] = re.sub(r'(?i)session_token=[^&]+', f'SESSION_TOKEN={new_token}', url)
                  updated = True
         
-        # 3. 发送 PATCH 请求更新
         payload = {"job": job_data}
         patch_resp = requests.patch(api_url, headers=headers, json=payload, timeout=10)
         
         if patch_resp.status_code == 200:
             masked = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
             print(f"✅ 成功将新的 SESSION_TOKEN ({masked}) 写回 cron-job.org (ID: {CRONJOB_ID})")
-            return True
+            return True, next_run_str
         else:
             print(f"❌ 更新 cron-job 失败: HTTP {patch_resp.status_code} - {patch_resp.text}")
-            return False
+            return False, ""
             
     except Exception as e:
         print(f"❌ 更新 cron-job.org 发生异常: {e}")
-        return False
+        return False, ""
 
-# 发送tg通知
+
 def send_telegram_message(message: str):
+    """发送 Telegram 消息通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("⚠️ Telegram 未配置，跳过通知")
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        print("✅ Telegram 通知已发送")
+        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        if resp.status_code == 200:
+            print("✅ Telegram 通知已发送")
+        else:
+            print(f"❌ Telegram 发送失败: HTTP {resp.status_code} - {resp.text}")
     except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+        print(f"❌ Telegram 发送异常: {e}")
 
-# 通知格式
+
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
+    """格式化通知模板"""
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -168,7 +194,7 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****' 
+        masked_email = EMAIL[:2] + '****' if EMAIL else "User"
     
     lines = [
         "🇫🇮 Bot-hosting 续期通知",
@@ -187,22 +213,27 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     lines.append(f"⏱️ 运行时间: {now}")
     return "\n".join(lines)
 
-# 等待Turnstile验证通过
+
 def wait_for_turnstile_pass(sb, timeout=30):
+    """等待 Cloudflare Turnstile 验证通过"""
     start = time.time()
     cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
-            return True
+        try:
+            page_lower = sb.get_page_source().lower()
+            if not any(x in page_lower for x in cf_indicators):
+                print("✅ Turnstile 验证已通过")
+                return True
+        except Exception:
+            pass
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
     
-# 获取当前出口ip
+
+
 def get_current_ip(proxy_server: str = "") -> str:
+    """获取当前出口 IP"""
     proxies = None
     if proxy_server:
         proxies = {"http": proxy_server, "https": proxy_server}
@@ -210,41 +241,43 @@ def get_current_ip(proxy_server: str = "") -> str:
     response.raise_for_status()
     return response.text.strip()
 
-# 时间格式化
+
 def format_countdown(countdown_str: str) -> str:
+    """优化倒计时格式显示"""
     try:
-        h, m, _ = countdown_str.split(':')
-        h = int(h)
-        m = int(m)
+        parts = countdown_str.split(':')
+        h = int(parts[0])
+        m = int(parts[1])
         if h > 0:
             return f"{h}h{m}min"
         else:
             return f"{m}min"
-    except:
+    except Exception:
         return countdown_str
 
-# 获取过期日期
+
 def extract_expiry_date(page_source: str) -> str:
+    """从页面源码提取到期日期"""
     patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
-        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
+        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   
+        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        
+        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", 
     ]
     for pattern in patterns:
         match = re.search(pattern, page_source)
         if match:
             date_str = match.group(1)
-            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
+            if len(date_str.split('/')[-1]) == 4:  
                 parts = date_str.split('/')
-                if len(parts[0]) == 2:  # 第一部分是2位（月）
+                if len(parts[0]) == 2:  
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
-    return None
+    return ""
 
-#   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
+
+# ==================== Discord OAuth 登录相关 ====================
 DISCORD_CLIENT_ID   = "884382422530158623"
 OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
 OAUTH_SCOPE         = "identify email guilds"
@@ -257,28 +290,25 @@ STATE_RE = re.compile(r"[?&]state=([^&]+)")
 
 
 def capture_discord_state(sb) -> str:
-    """打开 /login/discord，从落地页 URL 里提取本次会话的 state"""
+    """捕获 Discord 登录跳转的 state 参数"""
     print("🔎 获取 Discord OAuth state...")
     sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
     time.sleep(2)
-
     url = sb.get_current_url()
     if "discord.com" not in url:
         print(f"⚠️ 未跳转到 Discord 相关页面，当前 URL：{url}")
         return ""
-
     m = STATE_RE.search(url)
     if not m:
         print(f"❌ 未能从 URL 中解析出 state，当前 URL：{url}")
         return ""
-
     state = urllib.parse.unquote(m.group(1))
     print(f"✅ 已捕获 state（当前落地页：{urllib.parse.urlparse(url).path}）")
     return state
 
 
 def discord_authorize(state: str) -> str:
-    """用 DC_TOKEN 直接完成 Discord 侧授权，返回跳转回 bot-hosting.net 的 location"""
+    """向 Discord API 发送授权请求并拿回回调链接"""
     query = urllib.parse.urlencode({
         "client_id":     DISCORD_CLIENT_ID,
         "response_type": "code",
@@ -287,7 +317,6 @@ def discord_authorize(state: str) -> str:
         "state":         state,
     })
     authorize_url = f"{DISCORD_API}?{query}"
-
     referer = (
         "https://discord.com/oauth2/authorize?" +
         urllib.parse.urlencode({
@@ -298,7 +327,6 @@ def discord_authorize(state: str) -> str:
             "state":         state,
         })
     )
-
     headers = {
         "accept":           "*/*",
         "authorization":    DC_TOKEN,
@@ -308,7 +336,6 @@ def discord_authorize(state: str) -> str:
         "user-agent":       DISCORD_UA,
         "x-discord-locale": "zh-CN",
     }
-
     body = json.dumps({
         "permissions": "0",
         "authorize": True,
@@ -319,8 +346,6 @@ def discord_authorize(state: str) -> str:
             "channel_type": 10000,
         },
     })
-
-    # 如果配置了代理，Discord API 请求也走代理
     proxies = None
     _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
@@ -348,9 +373,8 @@ def discord_authorize(state: str) -> str:
 
 
 def do_discord_login(sb) -> bool:
-    """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
+    """执行完整的 Discord Token 登录流程（含全套截图兜底）"""
     print("\n🔑 通过 Discord Token 登录...")
-
     state = capture_discord_state(sb)
     if not state:
         sb.save_screenshot("login_no_state.png")
@@ -358,12 +382,12 @@ def do_discord_login(sb) -> bool:
 
     location = discord_authorize(state)
     if not location:
+        sb.save_screenshot("login_no_location.png")
         return False
 
     print("↩️ 携带授权码打开回调链接...")
     sb.uc_open_with_reconnect(location, reconnect_time=4)
     time.sleep(3)
-
     url = sb.get_current_url()
 
     if "/error/banned" in url:
@@ -403,7 +427,7 @@ def do_discord_login(sb) -> bool:
     return False
 
 
-# 主流程
+# ==================== 主流程控制 ====================
 def main():
     print("#" * 25)
     print("   Bot-hosting 自动续期")
@@ -432,7 +456,6 @@ def main():
 
         login_ok = False
 
-        # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
             print("🚀 启动浏览器...")
             sb.open("https://bot-hosting.net/")
@@ -456,9 +479,8 @@ def main():
                 login_ok = True
                 print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
             else:
-                print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}, 当前标题: {current_title}")
+                print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}")
 
-        # 方式2: Discord OAuth 登录（备用）
         if not login_ok and DC_TOKEN:
             _LOGIN_METHOD = "Discord Token"
             print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
@@ -491,7 +513,6 @@ def main():
         if _LOGIN_METHOD == "Discord Token":
             print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新并写回")
 
-        # 提取当前到期日期
         sb.sleep(2)
         page_source = sb.get_page_source()
         current_expiry = extract_expiry_date(page_source)
@@ -500,7 +521,6 @@ def main():
         else:
             print("⚠️ 未能提取当前到期日期")
 
-        # 寻找外部续期按钮
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
@@ -524,22 +544,20 @@ def main():
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
-            except Exception as e:
+            except Exception:
                 pass
 
-        # 点击外部续期按钮等待弹窗
         if outer_renew_selector:
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(2)
                 sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+                sb.sleep(15)  
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
 
-            # 处理弹窗中的 Turnstile
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
             for attempt in range(1, 4):
@@ -560,14 +578,10 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 点击续期按钮
             print("⏳ 等待续期按钮可用并点击...")
             time.sleep(5) 
-
-            modal_button_clicked = False
             try:
                 sb.click('button:contains("Renew for 4 days")', timeout=8)
-                modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
                 print(f"续期按钮点击失败: {e}")
@@ -575,15 +589,13 @@ def main():
             print("⏳ 等待新的过期时间...")
             sb.sleep(6)
 
-            # 提取新的到期日期和倒计时
             new_page_text = sb.get_page_source()
             new_expiry = extract_expiry_date(new_page_text)
             new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+            
             if new_match:
                 new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-                if new_expiry:
-                    print(f"📅 新的到期日期: {new_expiry}")
                 send_telegram_message(
                     format_notification(
                         "✅ 续期成功",
@@ -594,45 +606,20 @@ def main():
             else:
                 if new_expiry and new_expiry != current_expiry:
                     print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-                    send_telegram_message(
-                        format_notification(
-                            "✅ 续期成功",
-                            extra="到期日期已更新",
-                            expiry_date=new_expiry
-                        )
-                    )
+                    send_telegram_message(format_notification("✅ 续期成功", extra="到期日期已更新", expiry_date=new_expiry))
                 else:
                     print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
-                        )
-                    )
-
+                    send_telegram_message(format_notification("⚠️ 续期可能未成功", extra="请登录后台检查", expiry_date=current_expiry or "（未获取到）"))
         else:
             if countdown_text:
                 friendly = format_countdown(countdown_text)
                 print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                send_telegram_message(
-                    format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
+                send_telegram_message(format_notification("⏳ 未到续期时间", extra=f"⏱️ 可续期时间: {friendly}后", expiry_date=current_expiry or "（未获取到）"))
             else:
                 print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                send_telegram_message(
-                    format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
+                send_telegram_message(format_notification("ℹ️ 无需续期", extra="当前状态未知，请手动检查", expiry_date=current_expiry or "（未获取到）"))
 
-        # ========== Token 更新及 TG 通知逻辑 ==========
+        # ========== Token 更新及 TG 通知逻辑（含写回的 cron 时间）==========
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
         new_token, token_expiry = get_cookie_info(sb, "session_token")
         old_token = SESSION_TOKEN
@@ -641,8 +628,8 @@ def main():
             print("🔄 SESSION_TOKEN 需要更新")
             
             token_sync_status = []
+            cron_next_time = ""
             
-            # 1. 尝试更新 GitHub Secret (适用于 Actions 部署)
             if GH_TOKEN:
                 if update_github_secret("SESSION_TOKEN", new_token):
                     print("✅ SESSION_TOKEN 更新成功 (GitHub Secrets)")
@@ -653,26 +640,31 @@ def main():
             else:
                 print("⚠️ 未设置 GH_TOKEN，跳过更新 GitHub Secrets")
             
-            # 2. 尝试更新 cron-job.org 
             if CRONJOB_API_KEY and CRONJOB_ID:
-                if update_cronjob_org(new_token):
+                success, next_run = update_cronjob_org(new_token)
+                if success:
                     token_sync_status.append("✅ Cron-job.org: 写入成功")
+                    cron_next_time = next_run
                 else:
                     token_sync_status.append("❌ Cron-job.org: 写入失败")
             else:
                  print("⚠️ 未设置 CRONJOB_API_KEY 或 CRONJOB_ID，跳过更新 cron-job.org")
 
-            # 3. 汇总发送 Token 更新的独立通知
             if token_sync_status:
                 sync_msg = "\n".join(token_sync_status)
                 masked_token = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
+                
+                extra_content = f"🔑 新 Token: {masked_token}\n"
+                if cron_next_time:
+                    extra_content += f"⏰ Cron 下次执行: {cron_next_time}\n"
+                extra_content += f"\n同步状态:\n{sync_msg}"
+
                 send_telegram_message(
                     format_notification(
                         "🔄 SESSION_TOKEN 已刷新",
-                        extra=f"🔑 新 Token: {masked_token}\n\n同步状态:\n{sync_msg}"
+                        extra=extra_content
                     )
                 )
-
         else:
             print("✅ SESSION_TOKEN 无需更新")
         
