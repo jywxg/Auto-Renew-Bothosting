@@ -2,9 +2,24 @@
 # -*- coding: utf-8 -*-
 
 import os, re, sys, time, json, requests, subprocess
-import urllib.request, urllib.parse, urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
+
+LOCAL_TZ_OFFSET_HOURS = 8
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET_HOURS))
+
+def get_local_now() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+def format_local_time(dt: datetime = None) -> str:
+    if dt is None:
+        dt = get_local_now()
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
+    else:
+        dt = dt.astimezone(LOCAL_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 # 环境变量配置
 EMAIL           = os.environ.get("EMAIL") or ""           
@@ -14,7 +29,10 @@ GH_TOKEN        = os.environ.get("GH_TOKEN") or ""
 TG_CHAT_ID      = os.environ.get("TG_CHAT_ID") or ""      
 TG_BOT_TOKEN    = os.environ.get("TG_BOT_TOKEN") or ""    
 CRONJOB_API_KEY = os.environ.get("CRONJOB_API_KEY") or "" 
-CRONJOB_ID      = os.environ.get("CRONJOB_ID") or ""      
+CRONJOB_ID      = os.environ.get("CRONJOB_ID") or ""     
+
+IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -41,7 +59,7 @@ def get_cookie_info(sb, name):
         if c.get('name') == name:
             value = c.get('value')
             expiry_ts = c.get('expiry')
-            expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
+            expiry_dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc) if expiry_ts else None
             return value, expiry_dt
     return None, None
 
@@ -51,7 +69,7 @@ def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
     if new_value != old_value:
         return True
     if expiry_dt:
-        remaining = (expiry_dt - datetime.now()).total_seconds()
+        remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
         if remaining < days_threshold * 24 * 3600:
             return True
     return False
@@ -76,8 +94,8 @@ def update_github_secret(secret_name, new_value):
         else:
             print(f"❌ 更新失败: {proc.stderr.strip()}")
             return False
-    except Exception as e:
-        print(f"❌ 异常: {e}")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        print(f"❌ 异常: {type(e).__name__}: {e}")
         return False
 
 # ==========================================
@@ -102,9 +120,8 @@ def update_cronjob_schedule(countdown_str: str) -> tuple[bool, str, str]:
         # 计算下一次运行的 UTC 时间，用于提交给 cron-job.org
         next_run_utc = datetime.now(timezone.utc) + delta
         
-        # 将算出的时间转换为东八区 (UTC+8) 字符串，用于 TG 通知展示
-        local_ts = time.gmtime(next_run_utc.timestamp() + 8 * 3600)
-        display_time = time.strftime("%Y-%m-%d %H:%M:%S", local_ts)
+        # 将算出的时间转换为本地时区字符串，用于 TG 通知展示
+        display_time = format_local_time(next_run_utc)
 
         api_url = f"https://api.cron-job.org/jobs/{CRONJOB_ID}"
         headers = {
@@ -135,8 +152,8 @@ def update_cronjob_schedule(countdown_str: str) -> tuple[bool, str, str]:
             print(f"❌ 更新调度失败: HTTP {patch_resp.status_code}")
             return False, "API 更新失败", ""
             
-    except Exception as e:
-        print(f"❌ 更新调度异常: {e}")
+    except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"❌ 更新调度异常: {type(e).__name__}: {e}")
         return False, "发生异常", ""
 
 def send_telegram_message(message: str):
@@ -147,15 +164,14 @@ def send_telegram_message(message: str):
     try:
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
         print("✅ Telegram 通知已发送")
-    except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Telegram 发送失败: {type(e).__name__}: {e}")
 
 # ==========================================
 # 统一通知格式（直接在此处追加下次运行时间）
 # ==========================================
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "", next_run: str = "") -> str:
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    now = format_local_time()
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         if len(name) > 4:
@@ -200,21 +216,27 @@ def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
     if proxy_server:
         proxies = {"http": proxy_server, "https": proxy_server}
-    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-    response.raise_for_status()
-    return response.text.strip()
+    try:
+        response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        response.raise_for_status()
+        return response.text.strip()
+    except requests.exceptions.RequestException:
+        return "Unknown"
 
 def format_countdown(countdown_str: str) -> str:
     try:
-        h, m, _ = countdown_str.split(':')
-        h = int(h)
-        m = int(m)
+        if not isinstance(countdown_str, str):
+            return str(countdown_str)
+        parts = countdown_str.split(':')
+        if len(parts) < 2:
+            return countdown_str
+        h, m = int(parts[0]), int(parts[1])
         if h > 0:
             return f"{h}h{m}min"
         else:
             return f"{m}min"
-    except:
-        return countdown_str
+    except (ValueError, IndexError, AttributeError, TypeError):
+        return str(countdown_str) if countdown_str else ""
 
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
@@ -301,17 +323,15 @@ def discord_authorize(state: str) -> str:
     })
 
     proxies = None
-    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    if _is_proxy:
-        proxies = {"http": _proxy_server, "https": _proxy_server}
+    if IS_PROXY:
+        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
 
     try:
         resp = requests.post(authorize_url, headers=headers, data=body, proxies=proxies, timeout=20)
         if resp.status_code != 200:
             return ""
         resp_data = resp.json()
-    except Exception:
+    except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError):
         return ""
 
     location = resp_data.get("location", "")
@@ -346,9 +366,7 @@ def main():
     print("   Bot-hosting 自动续期")
     print("#" * 25)
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 
     sb_kwargs = {"uc": True, "headless": HEADLESS}
 
@@ -358,14 +376,11 @@ def main():
     else:
         print("🍭 未使用代理，直连访问")
 
-    global _LOGIN_METHOD
-    
+    login_method = _LOGIN_METHOD
+
     with SB(**sb_kwargs) as sb:
-        try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
-            print(f"📍 当前出口IP: {ip}")
-        except Exception as e:
-            print(f"⚠️ 获取出口 IP 失败: {e}")
+        ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+        print(f"📍 当前出口IP: {ip}")
 
         login_ok = False
 
@@ -395,7 +410,7 @@ def main():
                 print(f"❌ SESSION_TOKEN 登录失败")
 
         if not login_ok and DC_TOKEN:
-            _LOGIN_METHOD = "Discord Token"
+            login_method = "Discord Token"
             print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
             if do_discord_login(sb):
                 sb.open("https://bot-hosting.net/a/billings")
@@ -444,7 +459,7 @@ def main():
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
-            except Exception:
+            except (AttributeError, RuntimeError, TypeError):
                 pass
 
         # 核心通知变量，推迟到获取完 Cron-job 后统一发送
@@ -461,7 +476,9 @@ def main():
                 sb.click(outer_renew_selector)
                 sb.sleep(15)  
             except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                print(f"❌ 点击外部按钮失败: {type(e).__name__}: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
                 return
 
@@ -471,7 +488,9 @@ def main():
                 try:
                     sb.uc_gui_click_captcha()
                     time.sleep(12)
-                except Exception:
+                except Exception as e:
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
                     pass
 
                 if wait_for_turnstile_pass(sb, timeout=20):
@@ -490,7 +509,9 @@ def main():
                 sb.click('button:contains("Renew for 4 days")', timeout=8)
                 print("✅ 已点击续期按钮")
             except Exception as e:
-                pass
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                print(f"⚠️ 点击续期按钮时出错: {type(e).__name__}")
 
             print("⏳ 等待新的过期时间...")
             sb.sleep(6)
