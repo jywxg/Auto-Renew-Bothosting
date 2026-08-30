@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install --quiet seleniumbase requests
+          pip install --quiet -r requirements.txt
           seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box)
