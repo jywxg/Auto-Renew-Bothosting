@@ -7,12 +7,14 @@ from datetime import datetime
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+EMAIL           = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
+SESSION_TOKEN   = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
+DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
+GH_TOKEN        = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
+TG_CHAT_ID      = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
+TG_BOT_TOKEN    = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+CRONJOB_API_KEY = os.environ.get("CRONJOB_API_KEY") or "" # cron-job.org API Key
+CRONJOB_ID      = os.environ.get("CRONJOB_ID") or ""      # cron-job.org 任务 ID
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -80,6 +82,67 @@ def update_github_secret(secret_name, new_value):
             return False
     except Exception as e:
         print(f"❌ 异常: {e}")
+        return False
+
+# 写回 cron-job.org
+def update_cronjob_org(new_token: str) -> bool:
+    if not CRONJOB_API_KEY or not CRONJOB_ID:
+        print("⚠️ 未配置 CRONJOB_API_KEY 或 CRONJOB_ID，跳过更新 cron-job.org")
+        return False
+        
+    print("🔄 尝试将新 Token 写回 cron-job.org...")
+    api_url = f"https://api.cron-job.org/jobs/{CRONJOB_ID}"
+    headers = {
+        "Authorization": f"Bearer {CRONJOB_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        # 1. 获取当前 Job 的完整配置
+        resp = requests.get(api_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"❌ 获取 cron-job 失败: HTTP {resp.status_code} - {resp.text}")
+            return False
+            
+        job_data = resp.json().get("jobDetails", {})
+        
+        # 2. 替换 Token (支持 Header 和 URL 参数两种最常见的传参方式)
+        updated = False
+        
+        # 场景 A: Token 放在 HTTP Headers 里
+        if "extendedData" in job_data and "headers" in job_data["extendedData"]:
+            header_keys = [k for k in job_data["extendedData"]["headers"].keys()]
+            for k in header_keys:
+                if k.upper() == "SESSION_TOKEN":
+                    job_data["extendedData"]["headers"][k] = new_token
+                    updated = True
+            # 如果没找到且 headers 存在，直接追加进去以防万一
+            if not updated:
+                job_data["extendedData"]["headers"]["SESSION_TOKEN"] = new_token
+                updated = True
+                
+        # 场景 B: Token 放在 URL 里
+        if not updated:
+            url = job_data.get("url", "")
+            if "SESSION_TOKEN=" in url.upper():
+                 # 匹配大小写不敏感的 session_token=...
+                 job_data["url"] = re.sub(r'(?i)session_token=[^&]+', f'SESSION_TOKEN={new_token}', url)
+                 updated = True
+        
+        # 3. 发送 PATCH 请求更新
+        payload = {"job": job_data}
+        patch_resp = requests.patch(api_url, headers=headers, json=payload, timeout=10)
+        
+        if patch_resp.status_code == 200:
+            masked = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
+            print(f"✅ 成功将新的 SESSION_TOKEN ({masked}) 写回 cron-job.org (ID: {CRONJOB_ID})")
+            return True
+        else:
+            print(f"❌ 更新 cron-job 失败: HTTP {patch_resp.status_code} - {patch_resp.text}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ 更新 cron-job.org 发生异常: {e}")
         return False
 
 # 发送tg通知
@@ -427,7 +490,7 @@ def main():
             return
 
         if _LOGIN_METHOD == "Discord Token":
-            print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
+            print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新并写回")
 
         # 提取当前到期日期
         sb.sleep(2)
@@ -577,14 +640,22 @@ def main():
 
         if should_update_cookie(new_token, old_token, token_expiry):
             print("🔄 SESSION_TOKEN 需要更新")
+            
+            # 1. 尝试更新 GitHub Secret (适用于 Actions 部署)
             if GH_TOKEN:
                 if update_github_secret("SESSION_TOKEN", new_token):
-                    print("✅ SESSION_TOKEN 更新成功")
+                    print("✅ SESSION_TOKEN 更新成功 (GitHub Secrets)")
                 else:
-                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
+                    print("⚠️ 更新 GitHub Secret 失败，请检查 GH_TOKEN 权限")
             else:
-                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
-                print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
+                print("⚠️ 未设置 GH_TOKEN，跳过更新 GitHub Secrets")
+            
+            # 2. 尝试更新 cron-job.org 
+            if CRONJOB_API_KEY and CRONJOB_ID:
+                update_cronjob_org(new_token)
+            else:
+                 print("⚠️ 未设置 CRONJOB_API_KEY 或 CRONJOB_ID，跳过更新 cron-job.org")
+
         else:
             print("✅ SESSION_TOKEN 无需更新")
         
