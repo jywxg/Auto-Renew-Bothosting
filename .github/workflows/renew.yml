@@ -2,7 +2,7 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '0 6 * * *' # 每天UTC 5点 (北京时间14点, 一般都会推迟),自行根据服务到期时间调整
+    - cron: '0 4 * * *' # 每天UTC 3点 (北京时间12点, 一般都会推迟),自行根据服务到期时间调整
   workflow_dispatch:
 
 jobs:
@@ -43,6 +43,8 @@ jobs:
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CRONJOB_API_KEY: ${{ secrets.CRONJOB_API_KEY }}
+          CRONJOB_ID: ${{ secrets.CRONJOB_ID }}
         run: |
           xvfb-run --auto-servernum python3 app.py
 
