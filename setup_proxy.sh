@@ -361,88 +361,201 @@ for single_node in "${NODE_ARRAY[@]}"; do
     continue
   fi
 
-  # ----------------- 生成防注入 JSON 配置 -----------------
-  
-  # 对所有可能包含特俗符号的变量执行彻底转义，杜绝 JSON 注入
-  J_SVR=$(json_esc "$outbound_server")
-  J_UID=$(json_esc "$outbound_uuid")
-  J_PWD=$(json_esc "$outbound_password")
-  J_PW2=$(json_esc "$outbound_password2")
-  J_PTH=$(json_esc "$outbound_path")
-  J_HST=$(json_esc "$outbound_host")
-  J_SNI=$(json_esc "$outbound_sni")
-  J_ATH=$(json_esc "$outbound_auth")
-  J_OBF=$(json_esc "$outbound_obfs_password")
-  J_UNM=$(json_esc "$outbound_username")
-  J_PBK=$(json_esc "$outbound_reality_pbk")
-  J_SID=$(json_esc "$outbound_reality_sid")
+  # ----------------- 生成防注入 JSON 配置 (纯 jq 构建，彻底杜绝字符串拼接) -----------------
 
-  jq_outbound="{\"type\":\"$outbound_type\",\"tag\":\"proxy\",\"server\":\"$J_SVR\",\"server_port\":$outbound_port"
-  case "$outbound_type" in
-    vless)
-      jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\""
-      if [ -n "$outbound_flow" ]; then jq_outbound="$jq_outbound,\"flow\":\"$outbound_flow\""; fi
-      if [ "$outbound_transport_type" != "tcp" ]; then 
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
-      fi
-      tls_enabled="false"; if [ "$outbound_security" = "tls" ] || [ "$outbound_security" = "reality" ]; then tls_enabled="true"; fi
-      tls_json="{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}"
-      if [ "$outbound_security" = "reality" ]; then tls_json="$tls_json,\"reality\":{\"enabled\":true,\"public_key\":\"$J_PBK\",\"short_id\":\"$J_SID\"}"; fi
-      tls_json="$tls_json}"
-      jq_outbound="$jq_outbound,\"tls\":$tls_json"
-      ;;
-    vmess)
-      jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\",\"security\":\"auto\""
-      if [ "$outbound_transport_type" != "tcp" ]; then
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
-      fi
-      tls_enabled="false"; if [ "$outbound_security" = "tls" ]; then tls_enabled="true"; fi
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
-      ;;
-    trojan)
-      jq_outbound="$jq_outbound,\"password\":\"$J_PWD\""
-      if [ "$outbound_transport_type" != "tcp" ]; then
-        jq_outbound="$jq_outbound,\"transport\":{\"type\":\"$outbound_transport_type\",\"path\":\"$J_PTH\",\"headers\":{\"Host\":\"$J_HST\"}}"
-      fi
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
-      ;;
-    hysteria2)
-      jq_outbound="$jq_outbound,\"up_mbps\":$outbound_up_mbps,\"down_mbps\":$outbound_down_mbps"
-      if [ -n "$outbound_obfs_password" ]; then jq_outbound="$jq_outbound,\"obfs\":{\"type\":\"salamander\",\"password\":\"$J_OBF\"}"; fi
-      if [ -n "$outbound_auth" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_ATH\""; fi
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure}"
-      ;;
-    tuic)
-      jq_outbound="$jq_outbound,\"uuid\":\"$J_UID\""
-      if [ -n "$outbound_password2" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_PW2\""; fi
-      jq_outbound="$jq_outbound,\"congestion_control\":\"$outbound_congestion\",\"udp_over_stream\":$outbound_udp_over_stream,\"zero_rtt_handshake\":$outbound_zerortt"
-      tls_json="{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure"
-      if [ -n "$outbound_alpn" ]; then tls_json="$tls_json,\"alpn\":[\"$outbound_alpn\"]"; fi
-      tls_json="$tls_json}"
-      jq_outbound="$jq_outbound,\"tls\":$tls_json"
-      ;;
-    anytls)
-      jq_outbound="$jq_outbound,\"password\":\"$J_PWD\""
-      jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
-      ;;
-    socks)
-      if [ -n "$outbound_username" ]; then jq_outbound="$jq_outbound,\"username\":\"$J_UNM\""; fi
-      if [ -n "$outbound_password2" ]; then jq_outbound="$jq_outbound,\"password\":\"$J_PW2\""; fi
-      jq_outbound="$jq_outbound,\"version\":\"$outbound_version\""
-      ;;
-  esac
-  jq_outbound="$jq_outbound}"
+  build_outbound_json() {
+    local proto="$1"
+    local server="$2"
+    local port="$3"
 
-  cat << EOF > sing-box-config.json
-{
-  "log": {"level": "warn"},
-  "inbounds": [
-    {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-    {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
-  ],
-  "outbounds": [$jq_outbound]
-}
-EOF
+    jq -n \
+      --arg type "$proto" \
+      --arg server "$server" \
+      --argjson port "$port" \
+      --arg uuid "$outbound_uuid" \
+      --arg password "$outbound_password" \
+      --arg password2 "$outbound_password2" \
+      --arg path "$outbound_path" \
+      --arg host "$outbound_host" \
+      --arg sni "$outbound_sni" \
+      --arg auth "$outbound_auth" \
+      --arg obfs_pwd "$outbound_obfs_password" \
+      --arg username "$outbound_username" \
+      --arg pbk "$outbound_reality_pbk" \
+      --arg sid "$outbound_reality_sid" \
+      --arg flow "$outbound_flow" \
+      --arg transport "$outbound_transport_type" \
+      --arg security "$outbound_security" \
+      --arg fingerprint "$outbound_fingerprint" \
+      --arg congestion "$outbound_congestion" \
+      --arg alpn "$outbound_alpn" \
+      --arg insecure "$outbound_insecure" \
+      --argjson up_mbps "$outbound_up_mbps" \
+      --argjson down_mbps "$outbound_down_mbps" \
+      --arg udp_over_stream "$outbound_udp_over_stream" \
+      --arg zerortt "$outbound_zerortt" \
+      --arg version "$version" \
+      '
+      def boolify: if . == "true" then true else false end;
+      def opt($k; $v): if ($v | type == "string" and length > 0) then {($k): $v} else {} end;
+      def opt_b($k; $v): if ($v | type == "string" and length > 0) then {($k): ($v | boolify)} else {} end;
+      def opt_n($k; $v): if ($v | type == "number") then {($k): $v} else {} end;
+
+      # base
+      {
+        type: $type,
+        tag: "proxy",
+        server: $server,
+        server_port: $port
+      }
+
+      # protocol-specific fields
+      + if $type == "vless" then
+          {
+            uuid: $uuid,
+            security: "auto"
+          }
+          + (if ($flow | length) > 0 then {flow: $flow} else {} end)
+          + (if $transport != "tcp" then
+              {transport: {type: $transport, path: $path, headers: {Host: $host}}}
+            else {} end)
+          + (
+              if ($security == "tls" or $security == "reality") then
+                {
+                  tls: {
+                    enabled: true,
+                    server_name: $sni,
+                    insecure: ($insecure | boolify),
+                    utls: {enabled: true, fingerprint: $fingerprint}
+                  }
+                  + (if $security == "reality" then
+                      {reality: {enabled: true, public_key: $pbk, short_id: $sid}}
+                    else {} end)
+                }
+              else
+                {
+                  tls: {
+                    enabled: false,
+                    server_name: $sni,
+                    insecure: ($insecure | boolify),
+                    utls: {enabled: true, fingerprint: $fingerprint}
+                  }
+                }
+              end
+            )
+        elif $type == "vmess" then
+          {
+            uuid: $uuid,
+            security: "auto"
+          }
+          + (if $transport != "tcp" then
+              {transport: {type: $transport, path: $path, headers: {Host: $host}}}
+            else {} end)
+          + (
+              if $security == "tls" then
+                {
+                  tls: {
+                    enabled: true,
+                    server_name: $sni,
+                    insecure: ($insecure | boolify),
+                    utls: {enabled: true, fingerprint: $fingerprint}
+                  }
+                }
+              else
+                {
+                  tls: {
+                    enabled: false,
+                    server_name: $sni,
+                    insecure: ($insecure | boolify),
+                    utls: {enabled: true, fingerprint: $fingerprint}
+                  }
+                }
+              end
+            )
+        elif $type == "trojan" then
+          {password: $password}
+          + (if $transport != "tcp" then
+              {transport: {type: $transport, path: $path, headers: {Host: $host}}}
+            else {} end)
+          + {
+              tls: {
+                enabled: true,
+                server_name: $sni,
+                insecure: ($insecure | boolify),
+                utls: {enabled: true, fingerprint: $fingerprint}
+              }
+            }
+        elif $type == "hysteria2" then
+          {up_mbps: $up_mbps, down_mbps: $down_mbps}
+          + (if ($obfs_pwd | length) > 0 then
+              {obfs: {type: "salamander", password: $obfs_pwd}}
+            else {} end)
+          + (if ($auth | length) > 0 then {password: $auth} else {} end)
+          + {
+              tls: {
+                enabled: true,
+                server_name: $sni,
+                insecure: ($insecure | boolify)
+              }
+            }
+        elif $type == "tuic" then
+          {uuid: $uuid}
+          + (if ($password2 | length) > 0 then {password: $password2} else {} end)
+          + {
+              congestion_control: $congestion,
+              udp_over_stream: ($udp_over_stream | boolify),
+              zero_rtt_handshake: ($zerortt | boolify)
+            }
+          + (
+              {
+                tls: {
+                  enabled: true,
+                  server_name: $sni,
+                  insecure: ($insecure | boolify)
+                }
+                + (if ($alpn | length) > 0 then {alpn: [$alpn]} else {} end)
+              }
+            )
+        elif $type == "anytls" then
+          {password: $password}
+          + {
+              tls: {
+                enabled: true,
+                server_name: $sni,
+                insecure: ($insecure | boolify),
+                utls: {enabled: true, fingerprint: $fingerprint}
+              }
+            }
+        elif $type == "socks" then
+          (if ($username | length) > 0 then {username: $username} else {} end)
+          + (if ($password2 | length) > 0 then {password: $password2} else {} end)
+          + {version: "5"}
+        else {}
+        end
+      '
+  }
+
+  OUTBOUND_JSON=$(build_outbound_json "$outbound_type" "$outbound_server" "$outbound_port")
+  if [ -z "$OUTBOUND_JSON" ] || [ "$OUTBOUND_JSON" = "null" ]; then
+    echo "[WARN] ❌ 生成 outbound JSON 配置失败，跳过节点"
+    continue
+  fi
+
+  jq -n \
+    --argjson outbound "$OUTBOUND_JSON" \
+    '{
+      log: {level: "warn"},
+      inbounds: [
+        {type: "socks", tag: "socks-in", listen: "127.0.0.1", listen_port: 1080},
+        {type: "http", tag: "http-in", listen: "127.0.0.1", listen_port: 1081}
+      ],
+      outbounds: [$outbound]
+    }' > sing-box-config.json
+
+  if [ ! -s sing-box-config.json ]; then
+    echo "[WARN] ❌ 生成 sing-box 配置文件为空，跳过节点"
+    continue
+  fi
 
   # 进程深度清理
   if [ -n "$CURRENT_SB_PID" ]; then
