@@ -42,6 +42,8 @@ jobs:
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CRONJOB_API_KEY: ${{ secrets.CRONJOB_API_KEY }}
+          CRONJOB_ID: ${{ secrets.CRONJOB_ID }}
         run: |
           xvfb-run --auto-servernum python3 app.py
 
