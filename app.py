@@ -3,7 +3,7 @@
 
 import os, re, sys, time, json, requests, subprocess
 import urllib.request, urllib.parse, urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
@@ -13,6 +13,8 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用�
 GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+CRONJOB_API_KEY = os.environ.get("CRONJOB_API_KEY") or ""  # cron-job.org API Key，写回下次触发时间用
+CRONJOB_ID      = os.environ.get("CRONJOB_ID") or ""       # cron-job.org Job ID
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -81,6 +83,57 @@ def update_github_secret(secret_name, new_value):
     except Exception as e:
         print(f"❌ 异常: {e}")
         return False
+
+# 写回 cron-job.org：续期成功后，把 Job 的下次触发时间更新为指定日期的 hour:minute（北京时间）
+def update_cronjob_next_run(next_run_date, hour=9, minute=30):
+    """PATCH https://api.cron-job.org/jobs/{CRONJOB_ID}，只更新 schedule 字段"""
+    if not CRONJOB_API_KEY or not CRONJOB_ID:
+        print("⚠️ 未配置 CRONJOB_API_KEY / CRONJOB_ID，跳过写回 cron-job")
+        return False
+    try:
+        schedule = {
+            "timezone": "Asia/Shanghai",
+            "expiresAt": 0,
+            "hours": [hour],
+            "minutes": [minute],
+            "mdays": [next_run_date.day],
+            "months": [next_run_date.month],
+            "wdays": [-1],
+        }
+        resp = requests.patch(
+            f"https://api.cron-job.org/jobs/{CRONJOB_ID}",
+            headers={
+                "Authorization": f"Bearer {CRONJOB_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"job": {"enabled": True, "schedule": schedule}},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            print(f"✅ cron-job 写回成功：下次触发 {next_run_date} {hour:02d}:{minute:02d}（北京时间）")
+            return True
+        print(f"❌ cron-job 写回失败: HTTP {resp.status_code} - {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"❌ cron-job 写回异常: {e}")
+        return False
+
+
+def schedule_next_cronjob(new_expiry):
+    """根据新的到期日期计算下次触发时间（到期前 1 天 09:30 北京时间）并写回 cron-job.org"""
+    if not new_expiry:
+        return False
+    try:
+        exp = datetime.strptime(new_expiry, "%Y/%m/%d").date()
+    except Exception:
+        print(f"⚠️ 到期日期格式无法解析: {new_expiry}，跳过写回 cron-job")
+        return False
+    beijing_today = datetime.now(timezone(timedelta(hours=8))).date()
+    next_run = exp - timedelta(days=1)
+    if next_run <= beijing_today:
+        next_run = beijing_today + timedelta(days=1)
+        print(f"⚠️ 计算的下次触发时间已过，顺延为明天: {next_run}")
+    return update_cronjob_next_run(next_run)
 
 # 发送tg通知
 def send_telegram_message(message: str):
@@ -530,6 +583,8 @@ def main():
                         expiry_date=new_expiry or "（未获取到）"
                     )
                 )
+                # 写回 cron-job.org：下次在到期前 1 天触发
+                schedule_next_cronjob(new_expiry)
             else:
                 if new_expiry and new_expiry != current_expiry:
                     print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
@@ -540,6 +595,8 @@ def main():
                             expiry_date=new_expiry
                         )
                     )
+                    # 写回 cron-job.org：下次在到期前 1 天触发
+                    schedule_next_cronjob(new_expiry)
                 else:
                     print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
                     send_telegram_message(
